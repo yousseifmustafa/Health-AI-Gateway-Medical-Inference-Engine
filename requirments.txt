@@ -1,0 +1,54 @@
+torch
+FlagEmbedding
+
+# FastAPI and ASGI Server (for production deployment)
+fastapi
+uvicorn[standard]
+gunicorn
+
+# Core Python Utilities
+python-dotenv
+requests 
+pydantic
+typing-extensions
+
+# Image/File Handling (Needed for /ocr_analyze endpoint)
+python-multipart 
+Pillow 
+cloudinary
+
+accelerate
+bitsandbytes
+
+# --- 2. Core AI Frameworks (The Brain) ---
+langchain
+langchain-core
+langchain-community
+langgraph
+langchain-huggingface
+
+# --- 3. API Integrations (Missing in your list!) ---
+langchain-google-genai
+langchain-google-community
+google-generativeai
+groq
+huggingface-hub
+
+# --- 4. Local Models & Embeddings ---
+FlagEmbedding
+sentence-transformers
+pymilvus
+
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+pydantic
+requests
+typing-extensions
+
+python-dotenv
+cloudinary
+Pillow
+aiofiles
+langchain_tavily 

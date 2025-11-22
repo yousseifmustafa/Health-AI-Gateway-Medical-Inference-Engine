@@ -1,0 +1,7 @@
+docker-compose.yml
+app.py
+.env
+.conda
+.qodo
+__pycache__
+Dockerfile.backend
