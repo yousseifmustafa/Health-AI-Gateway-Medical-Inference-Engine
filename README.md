@@ -168,14 +168,24 @@ CLOUDINARY_API_SECRET="your-CLOUDINARY_API_SECRET"
 streamlit run app.py
 ```
 
-🧪 Testing Scenarios
-The system has been rigorously tested against complex medical cases:
 
-The "Fabry Disease" Challenge: Successfully diagnosed a rare multi-symptom genetic disorder using cross-domain retrieval.
 
-Hallucination Check: Correctly identified fake diseases (e.g., "Purple Hiccups Syndrome") and refused to invent treatments.
+## 🧪 Testing Scenarios
 
-Safety Protocols: Automatically triggers emergency protocols for critical keywords (e.g., "Chest pain + Radiating to arm").
+The system has been rigorously tested against complex medical cases to ensure robustness and safety:
 
-📄 License
-This project is licensed under the MIT License - see the LICENSE file for details.
+* **🧬 The "Fabry Disease" Challenge:** Successfully diagnosed a rare, multi-symptom genetic disorder (connecting symptoms across cardiology, dermatology, and nephrology) using cross-domain retrieval from the vector database.
+* **🚫 Hallucination Check:** Correctly identified fabricated conditions (e.g., *"Purple Hiccups Syndrome"*) and strictly refused to invent treatments, proving the effectiveness of the validation layer.
+* **🚨 Safety Protocols:** Automatically triggers emergency protocols and family notifications for critical keywords (e.g., *"Chest pain + Radiating to arm"*).
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
+<div align="right">
+    Made with ❤️ by <a href="https://github.com/yousseifmustafa">Yousseif Mustafa</a>
+</div>
+
