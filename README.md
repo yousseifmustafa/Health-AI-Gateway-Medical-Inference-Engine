@@ -136,15 +136,16 @@ flowchart TD
 | Component | Technology | Description |
 | :--- | :--- | :--- |
 | **Orchestration** | **LangGraph** | Managing cyclic state and multi-agent workflows. |
-| **LLM Core** | **Gemini 2.0 Flash** | High-speed inference for routing and generation. |
-| **Vector DB** | **Zilliz Cloud (Milvus)** | Storing 1M+ medical semantic chunks. |
+| **LLM Core** | **ModelManager** | Centralized wrapper for high-speed inference routing and caching. |
+| **Vector DB** | **Zilliz Cloud (Milvus)** | Storing 2M+ medical semantic chunks. |
 | **Embeddings** | **Gemma-300m** | Open-weights model for semantic text representation. |
 | **Backend** | **FastAPI** | Asynchronous, high-performance web framework. |
 | **Validation** | **Pydantic** | Strict output parsing and structured data validation. |
 | **Search** | **Tavily API** | Real-time web search for drug prices and clinics. |
+| **Media Storage** | **Cloudinary** | Secure cloud hosting and optimization for uploaded medical images. |
+| **Deployment** | **Lightning AI** | Scalable cloud infrastructure for hosting the full AI pipeline. |
 
----
-
+```
 ## 💻 Installation & Setup
 
 1. **Clone the repository**
