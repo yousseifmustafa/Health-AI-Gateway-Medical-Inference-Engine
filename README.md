@@ -94,6 +94,31 @@ flowchart TD
     %% Highlight the loop edge
     linkStyle 6 stroke:#2196f3,stroke-width:3px,color:red;
 ```
+
+### 3. Multimodal Vision Pipeline (Prescriptions & Drug-Box)
+A dedicated, asynchronous pipeline for handling medical imagery. It decouples the upload process (I/O bound) from the vision analysis (Compute bound) to ensure system responsiveness.
+
+```mermaid
+flowchart TD
+    %% Nodes Definitions
+    S(("Start"))
+    UP["☁️ Upload Node<br/>(Cloudinary API)"]
+    VIS["👁️ Vision Analysis Node<br/>(Groq / HF / Gemini)"]
+    E(("End / Output"))
+
+    %% Happy Path
+    S -->|User Query + Image Bytes| UP
+    UP -->|Secure Image URL| VIS
+    VIS -->|Medical Description / OCR| E
+
+    %% Error Handling
+    UP -.->|Upload Failed| E
+    
+    %% Styling
+    style S fill:#f9f9f9,stroke:#333,stroke-width:2px
+    style E fill:#000,stroke:#000,color:#fff
+    style UP fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style VIS fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
 ## 🚀 Key Features
 
 * **🤖 Agentic Triage Router:** Uses LLM-based intent classification to dynamically dispatch tasks. It knows the difference between *"I have a headache"* (Doctor) and *"How much is Panadol?"* (Search).
@@ -180,9 +205,6 @@ The system has been rigorously tested against complex medical cases to ensure ro
 
 ---
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 
 <div align="right">
