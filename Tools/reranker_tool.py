@@ -1,10 +1,14 @@
-from typing import List, Any 
+import asyncio
+from typing import List, Any
 import os
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 def rerank_contexts(
     query: str,
-    contexts: List[str], 
-    reranker_model: Any, 
+    contexts: List[str],
+    reranker_model: Any,
     top_n: int = 3
     ) -> List[str]:
     """
@@ -39,3 +43,12 @@ def rerank_contexts(
         print(f"Error during reranking: {e}. Returning original contexts truncated.")
         return contexts[:top_n]
 
+
+async def async_rerank_contexts(
+    query: str,
+    contexts: List[str],
+    reranker_model: Any,
+    top_n: int = 3
+    ) -> List[str]:
+    """Async version — offloads the CPU-bound reranker computation to a thread pool."""
+    return await asyncio.to_thread(rerank_contexts, query, contexts, reranker_model, top_n)

@@ -7,26 +7,20 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import InjectedState
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_community import GoogleSearchAPIWrapper
-from langgraph.checkpoint.memory import MemorySaver
 from dotenv import load_dotenv
 import os
+import asyncio
 from langchain_community.tools.tavily_search import TavilySearchResults
+
 try:
-    from Models.Model_Manager import ModelManager
-    from Helper.HF_ApiManager import hf_ApiKeyManager
-    from Helper.Groq_ApiManger import groq_ApiKeyManager
-    from Helper.Google_ApiManger import google_ApiKeyManager 
+    from Models.Model_Manager import get_model_manager
     from Langgraphs.Diagnose_graph import diagnose_app
+    from Tools.Query_Optimization_Tool import async_translate_rewrite_expand_query
+    from Database_Manager import get_checkpointer
 except ImportError:
     pass
 
 load_dotenv()
-
-# Initialization
-HF_key_manager = hf_ApiKeyManager()
-Google_key_manger = google_ApiKeyManager()
-groq_keyManger= groq_ApiKeyManager()
-model_manager = ModelManager(HF_key_manager=HF_key_manager, Google_key_manger=Google_key_manger , groq_keyManger = groq_keyManger)
 
 
 @tool
@@ -41,13 +35,28 @@ async def consult_doctor_tool(symptom_description: str, medical_history: str = "
     - symptom_description: A comprehensive summary of the symptoms (including Duration, Severity, and Location) .
     - medical_history: Chronic diseases (e.g., Diabetes, Hypertension) and current medications. This field is MANDATORY for diagnostic accuracy.
     """
+    # Optimize the query HERE — only when the Doctor tool is actually invoked
+    mm = get_model_manager()
+    try:
+        translated, expanded = await async_translate_rewrite_expand_query(
+            mm.optimize_query,
+            symptom_description
+        )
+    except Exception as e:
+        print(f"Query optimization failed: {e}")
+        translated = symptom_description
+        expanded = [symptom_description]
+
     inputs = {
         "user_query": symptom_description,
         "conversation_summary": medical_history,
+        "translated_query": translated,
+        "expanded_queries": expanded,
     }
-    
+
     result = await diagnose_app.ainvoke(inputs)
     return result.get("final_answer", "Cant Diagnose Your Case.")
+
 
 @tool
 async def analyze_medical_image_tool(query: str, state: Annotated[dict, InjectedState]):
@@ -61,19 +70,23 @@ async def analyze_medical_image_tool(query: str, state: Annotated[dict, Injected
     - query: A specific question or instruction regarding the image content (e.g., "Read the medicine names", "Analyze this X-ray for fractures").
     """
     image_bytes = state.get("image_bytes")
-    
+
     # Strict Check: No image, no service.
-    if not image_bytes: return "Error: No image data found in the current state."
+    if not image_bytes:
+        return "Error: No image data found in the current state."
 
     try:
-        ocr_response = model_manager.generate_with_image(text=query, image_bytes=image_bytes)
+        mm = get_model_manager()
+        ocr_response = await mm.agenerate_with_image(
+            text=query, image_bytes=image_bytes
+        )
         return {"answer": ocr_response}
     except Exception as e:
         return f"Vision Analysis Failed: {str(e)}"
 
 
 @tool
-def web_search_tool(query: str):
+async def web_search_tool(query: str):
     """
     Function:
     Access real-time external information via Tavily (Primary) or Google Search (Fallback).
@@ -93,35 +106,58 @@ def web_search_tool(query: str):
         if not os.getenv("TAVILY_API_KEY"):
             raise Exception("Tavily API Key not found in env.")
 
-        print("🚀 Using Tavily Search (High Precision)...")
+        print(f"🚀 Using Tavily Search for: {query} ...")
+
         search = TavilySearchResults(
             max_results=3,
             include_answer=True,
-            include_raw_content=True 
-        )
-        results = search.invoke(query)
-        return f"[Source: Tavily API]\n{str(results)}"
+            include_raw_content=False
+            )
+
+        raw_results = await search.ainvoke(query)
+
+        if isinstance(raw_results, str):
+            return f"[Source: Tavily API]\n{raw_results}"
+
+        formatted_results = ["[Source: Tavily API]"]
+
+        for result in raw_results:
+            title = result.get('title', 'No Title')
+            url = result.get('url', 'No URL')
+            content = result.get('content', 'No Content Available')
+
+            entry = (
+                f"\n---\n"
+                f"Title: {title}\n"
+                f"Link: {url}\n"
+                f"Summary: {content}\n"
+            )
+            formatted_results.append(entry)
+
+        return "".join(formatted_results)
 
     except Exception as e:
-        print(f" Tavily Failed or Limit Reached: {e}")
-        
+        print(f"Tavily Failed: {e}. Switching to Google...")
+
         try:
             search = GoogleSearchAPIWrapper(
                 google_api_key=os.getenv("GOOGLE_API_KEY"),
                 google_cse_id=os.getenv("GOOGLE_CSE_ID")
             )
-            return f"[Source: Google API]\n{search.run(query)}"
-            
+            result = await asyncio.to_thread(search.run, query)
+            return f"[Source: Google API]\n{result}"
+
         except Exception as google_e:
-            return f"Web Search Failed completely. Google Error: {str(google_e)}"
-        
+            return f"Web Search Failed completely. Error: {str(google_e)}"
+
+
 @tool
-def notify_family_tool(message: str, urgency_level: str = "High"):
+async def notify_family_tool(message: str, urgency_level: str = "High"):
     """
     Function:
     Triggers an emergency alert system to notify the patient's family members via SMS or Automated Call.
 
-    ⚠️ STRICT USAGE PROTOCOL:
+     STRICT USAGE PROTOCOL:
     1. **Direct Request:** If the user explicitly asks (e.g., "Tell my family", "Call home"), you MUST trigger this tool **IMMEDIATELY**.
        -  DO NOT ask "Are you sure?".
        -  DO NOT wait for further confirmation text.
@@ -136,35 +172,38 @@ def notify_family_tool(message: str, urgency_level: str = "High"):
     print(f"\n [SIMULATION] SENDING ALERT TO FAMILY")
     print(f" Message: {message}")
     print(f" Urgency: {urgency_level}")
-    print(f" Status: Sent Successfully via Mock Gateway\n")    
+    print(f" Status: Sent Successfully via Mock Gateway\n")
     return "Success: Family notification sent successfully. The family has been alerted and will contact the patient shortly."
 
 
 # Agent Logic
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
-    image_bytes: bytes | None 
+    image_bytes: bytes | None
     conversation_summary: str
-    
+
+
 async def agent_node(state: AgentState):
     messages = state["messages"]
+    mm = get_model_manager()
+
     try:
-        token = Google_key_manger.get_next_api_key()
+        token = mm.Google_key_manger.get_next_api_key()
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
             google_api_key=token,
-            temperature=0.3, 
+            temperature=0.3,
             streaming=True
         )
-    except Exception as e:        
+    except Exception as e:
         return {"messages": [AIMessage(content=str(e))]}
     tools = [consult_doctor_tool, web_search_tool, notify_family_tool]
-    
+
     if state.get("image_bytes"):
         tools.append(analyze_medical_image_tool)
 
     llm_with_tools = llm.bind_tools(tools)
-   
+
     sys_msg = SystemMessage(content="""
     You are 'SehaTech AI', an intelligent and professional medical triage assistant.
     Your core mission is to construct a comprehensive "Clinical Picture", forward it to the specialized Doctor Agent, and then relay the diagnosis to the user.
@@ -207,14 +246,14 @@ async def agent_node(state: AgentState):
     - Be warm, empathetic, and reassuring (e.g., "سلامتك يا بطل", "Don't worry").
     """)
     all_msgs = [sys_msg] + messages
-    
+
     response = await llm_with_tools.ainvoke(all_msgs)
-    
+
     return {"messages": [response]}
 
 
-# Workflow
-tool_node = ToolNode([notify_family_tool , consult_doctor_tool, analyze_medical_image_tool, web_search_tool])
+# --- Graph Definition (built once, compiled lazily with checkpointer) ---
+tool_node = ToolNode([notify_family_tool, consult_doctor_tool, analyze_medical_image_tool, web_search_tool])
 workflow = StateGraph(AgentState)
 
 workflow.add_node("agent", agent_node)
@@ -225,8 +264,25 @@ workflow.add_conditional_edges(
     "agent",
     tools_condition,
 )
-
 workflow.add_edge("tools", "agent")
-memory = MemorySaver()
-main_app = workflow.compile(checkpointer=memory)
-__all__ = ["main_app", "AgentState"]
+
+
+# --- Lazy Factory: compiles with PostgreSQL checkpointer on first call ---
+_compiled_app = None
+
+
+async def make_graph():
+    """
+    Async factory that returns the compiled supervisor graph with PostgreSQL persistence.
+    Called by LangGraph Studio (via langgraph.json entry point) or by application code.
+    On first call: initializes the AsyncPostgresSaver and compiles the graph.
+    """
+    global _compiled_app
+    if _compiled_app is None:
+        checkpointer = await get_checkpointer()
+        _compiled_app = workflow.compile(checkpointer=checkpointer)
+        print("INFO: Supervisor graph compiled with PostgreSQL checkpointer.")
+    return _compiled_app
+
+
+__all__ = ["make_graph", "AgentState"]

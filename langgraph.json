@@ -1,0 +1,13 @@
+{
+  "dockerfile_lines": [],
+  "graphs": {
+    "Image_Analyzer": "./Langgraphs/analyze_graph.py:image_analysis_app",
+    "Diagnose_graph": "./Langgraphs/Diagnose_graph.py:diagnose_app",
+    "supervisor_graph": "./Langgraphs/supervisor_graph.py:make_graph"
+  },
+  "env": "./.env",
+  "python_version": "3.11",
+  "dependencies": [
+    "."
+  ]
+}

@@ -1,4 +1,5 @@
 import os
+import asyncio
 from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
@@ -32,4 +33,6 @@ def upload_to_cloudinary(image_bytes: bytes) -> str | None:
         return None
 
 
-
+async def async_upload_to_cloudinary(image_bytes: bytes) -> str | None:
+    """Async wrapper — offloads sync Cloudinary upload to thread pool."""
+    return await asyncio.to_thread(upload_to_cloudinary, image_bytes)
