@@ -266,6 +266,8 @@ workflow.add_conditional_edges(
 )
 workflow.add_edge("tools", "agent")
 
+from langgraph.checkpoint.memory import MemorySaver
+
 
 # --- Lazy Factory: compiles with PostgreSQL checkpointer on first call ---
 _compiled_app = None
@@ -276,12 +278,17 @@ async def make_graph():
     Async factory that returns the compiled supervisor graph with PostgreSQL persistence.
     Called by LangGraph Studio (via langgraph.json entry point) or by application code.
     On first call: initializes the AsyncPostgresSaver and compiles the graph.
+    Falls back to MemorySaver if PostgreSQL is unavailable.
     """
     global _compiled_app
     if _compiled_app is None:
-        checkpointer = await get_checkpointer()
+        try:
+            checkpointer = await get_checkpointer()
+            print("INFO: Supervisor graph compiled with PostgreSQL checkpointer.")
+        except Exception as e:
+            print(f"WARNING: PostgreSQL unavailable ({e}). Falling back to MemorySaver.")
+            checkpointer = MemorySaver()
         _compiled_app = workflow.compile(checkpointer=checkpointer)
-        print("INFO: Supervisor graph compiled with PostgreSQL checkpointer.")
     return _compiled_app
 
 

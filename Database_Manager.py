@@ -14,7 +14,6 @@ Requires:
 import os
 import uuid
 import asyncio
-import threading
 from dotenv import load_dotenv
 
 from psycopg_pool import AsyncConnectionPool
@@ -34,12 +33,15 @@ CREATE TABLE IF NOT EXISTS user_threads (
 
 CREATE INDEX IF NOT EXISTS idx_user_threads_mongo_id
     ON user_threads (mongo_user_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_threads_active_user
+    ON user_threads (mongo_user_id) WHERE is_active = TRUE;
 """
 
 # --- Singleton Pool & Checkpointer ---
 _pool: AsyncConnectionPool | None = None
 _checkpointer: AsyncPostgresSaver | None = None
-_lock = threading.Lock()
+_lock = asyncio.Lock()
 _setup_done = False
 
 
@@ -61,7 +63,7 @@ async def get_checkpointer() -> AsyncPostgresSaver:
     if _checkpointer is not None and _setup_done:
         return _checkpointer
 
-    with _lock:
+    async with _lock:
         if _checkpointer is not None and _setup_done:
             return _checkpointer
 
@@ -107,25 +109,21 @@ async def get_or_create_thread(mongo_id: str) -> str:
         await get_checkpointer()  # ensure pool is ready
 
     async with _pool.connection() as conn:
-        # Check for existing active thread
-        row = await conn.execute(
-            "SELECT thread_id FROM user_threads WHERE mongo_user_id = %s AND is_active = TRUE LIMIT 1",
-            (mongo_id,)
-        )
-        result = await row.fetchone()
-
-        if result:
-            return str(result[0])
-
-        # Create new thread
+        # Atomic upsert — prevents TOCTOU race on concurrent requests
         new_thread_id = str(uuid.uuid4())
-        await conn.execute(
-            "INSERT INTO user_threads (mongo_user_id, thread_id) VALUES (%s, %s)",
+        row = await conn.execute(
+            """
+            INSERT INTO user_threads (mongo_user_id, thread_id)
+            VALUES (%s, %s)
+            ON CONFLICT (mongo_user_id) WHERE is_active = TRUE
+            DO UPDATE SET mongo_user_id = EXCLUDED.mongo_user_id
+            RETURNING thread_id
+            """,
             (mongo_id, new_thread_id)
         )
+        result = await row.fetchone()
         await conn.commit()
-        print(f"INFO: Created new thread {new_thread_id} for user {mongo_id}")
-        return new_thread_id
+        return str(result[0])
 
 
 async def deactivate_thread(mongo_id: str) -> bool:
