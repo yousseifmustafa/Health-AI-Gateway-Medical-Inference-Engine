@@ -1,25 +1,30 @@
-from typing import TypedDict, List, Optional, Any
+from typing import List, Optional, Any
 from langgraph.graph import StateGraph, END, START
 import asyncio
 import threading
+import logging
 from langchain_core.messages import SystemMessage, HumanMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+logger = logging.getLogger("sehatech.diagnose")
 
 try:
     from Models.Model_Manager import get_model_manager
-    from vector_db.VDB_Conection import create_retriever
+    from vector_db.vdb_connection import create_retriever
     from Tools.reranker_tool import async_rerank_contexts
-    from Tools.create_final_prompt_tool import create_final_prompt
     from Tools.parallel_retrievs_tool import parallel_retrieval
 except ImportError as e:
-    print(f"FATAL ERROR: Could not import helper functions: {e}")
+    logger.critical("Could not import helper functions: %s", e)
     exit()
+
 
 
 # --- Lazy Retriever Holder (ModelManager is shared via get_model_manager) ---
 class _RetrieverHolder:
-    """Lazy singleton for the vector DB retriever only. ModelManager comes from the shared singleton."""
+    """Lazy singleton for the vector DB retriever only. 
+    ModelManager comes from the shared singleton."""
+    
     _instance = None
     _lock = threading.Lock()
 
@@ -37,9 +42,14 @@ class _RetrieverHolder:
         if self._retriever is None:
             with self._lock:
                 if self._retriever is None:
-                    print("INFO: Lazy-initializing Zilliz Retriever...")
+                    logger.info("Lazy-initializing Zilliz Retriever...")
                     mm = get_model_manager()
-                    self._retriever = create_retriever(mm.embedding_model)
+                    retriever = create_retriever(mm.embedding_model)
+                    if retriever is None:
+                        raise RuntimeError(
+                            "Failed to create Zilliz retriever — check ZILLIZ_URI and ZILLIZ_TOKEN."
+                        )
+                    self._retriever = retriever
         return self._retriever
 
 
@@ -47,24 +57,47 @@ def _get_retriever():
     return _RetrieverHolder().context_retriever
 
 
-# --- 1. State Definition ---
-class DiagnoseState(TypedDict):
-    user_query: str
-    conversation_summary: str
+# ============================================================================
+# STATE SCHEMAS — Multiple Schemas Pattern (Input / Output / Internal)
+# ============================================================================
+
+class DiagnoseInputState(BaseModel):
+    """Schema for data accepted FROM the supervisor's consult_doctor_tool."""
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    user_query: str = ""
+    conversation_summary: str = ""
+    translated_query: str = ""
+    expanded_queries: list[str] = []
+
+
+class DiagnoseOutputState(BaseModel):
+    """Schema for data returned TO the caller — no RAG chunks or scores."""
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    final_answer: Optional[str] = None
+
+
+class DiagnoseState(BaseModel):
+    """Internal superset — contains every field nodes may read or write."""
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    user_query: str = ""
+    conversation_summary: str = ""
 
     # Pre-optimized by the Supervisor — passed as initial inputs
-    translated_query: str
-    expanded_queries: List[str]
+    translated_query: str = ""
+    expanded_queries: list[str] = []
 
     # Unified Answer Field
-    english_medical_answer: str
-    confidence_score: float
+    english_medical_answer: str = ""
+    confidence_score: float = 0.0
 
     # RAG Fields (strings only — no heavy Document objects in state)
-    support_contents: List[str]
-    final_docs: List[str]
+    support_contents: list[str] = []
+    final_docs: list[str] = []
 
-    final_answer: Optional[str]
+    final_answer: Optional[str] = None
 
 
 # --- 2. Helper Models ---
@@ -80,10 +113,10 @@ async def generate_node(state: DiagnoseState):
     Generates a medically accurate answer, validates it inline, and matches
     the user's language/dialect automatically.
     """
-    query = state["translated_query"]
-    user_query = state["user_query"]
-    summary = state["conversation_summary"]
-    docs = state.get("final_docs", [])
+    query = state.translated_query
+    user_query = state.user_query
+    summary = state.conversation_summary
+    docs = state.final_docs  
     mm = get_model_manager()
 
     # --- Build evidence section ---
@@ -125,7 +158,7 @@ EXAMPLE OUTPUT STRUCTURE (adapt language to match user):
 • **الأسباب المحتملة (Possible Causes):** [...]
 • **الخطوات المقترحة (Recommended Actions):** [...]
 • **أدوية مقترحة (Suggested Medications):** [...]
-• **⚠️ تحذيرات (Warnings):** [...]
+• ** تحذيرات (Warnings):** [...]
 """
 
     user_prompt = f"""## Previous Conversation Summary:
@@ -147,7 +180,7 @@ Provide your expert, self-validated medical analysis following ALL protocol step
         final_input = f"{system_prompt}\n\n{user_prompt}"
         answer = await mm.agenerate_answer(final_input)
     except Exception as e:
-        print(f"Generator Error: {e}")
+        logger.exception("Generator Error")
         answer = "I cannot generate an answer at this moment."
 
     return {"english_medical_answer": answer, "final_answer": answer}
@@ -155,14 +188,14 @@ Provide your expert, self-validated medical analysis following ALL protocol step
 
 async def grade_answer_node(state: DiagnoseState):
     """The Judge — Evaluate Confidence. Routes to END or RAG loop."""
-    query = state["translated_query"]
-    answer = state["english_medical_answer"]
+    query = state.translated_query
+    answer = state.english_medical_answer
     mm = get_model_manager()
 
     try:
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash-lite",
-            google_api_key=mm.Google_key_manger.get_next_api_key(),
+            google_api_key=mm.google_key_manager.get_next_api_key(),
             temperature=0
         )
         grader_llm = llm.with_structured_output(GradeOutput)
@@ -178,9 +211,9 @@ async def grade_answer_node(state: DiagnoseState):
             HumanMessage(content=f"Query: {query}\nAnswer: {answer}")
         ])
         score = grade.score
-        print(f"Grade Score is ={score}\n ")
+        logger.info("Grade Score = %s", score)
     except Exception as e:
-        print(f"Grading Failed: {e}")
+        logger.warning("Grading Failed: %s", e)
         score = 0.0
 
     return {"confidence_score": score}
@@ -188,11 +221,12 @@ async def grade_answer_node(state: DiagnoseState):
 
 async def retrieve_node(state: DiagnoseState):
     """Retrieve Documents (Only runs if needed). Stores only text content, not full objects."""
-    expanded_queries = state["expanded_queries"]
-    retriever = _get_retriever()
+    expanded_queries = state.expanded_queries
     try:
+        retriever = _get_retriever()
         docs = await parallel_retrieval(retriever, expanded_queries)
-    except Exception:
+    except Exception as e:
+        logger.error("Retrieval failed: %s", e)
         docs = []
     # Store only page_content strings — avoids state bloat from full Document objects
     contents = [doc.page_content for doc in docs if hasattr(doc, 'page_content')]
@@ -201,8 +235,8 @@ async def retrieve_node(state: DiagnoseState):
 
 async def rerank_node(state: DiagnoseState):
     """Filter Documents & Flag Context Presence. Skips reranking if docs ≤ top_n."""
-    query = state["translated_query"]
-    docs = state.get("support_contents", [])
+    query = state.translated_query
+    docs = state.support_contents
     mm = get_model_manager()
     top_n = 3
 
@@ -212,7 +246,7 @@ async def rerank_node(state: DiagnoseState):
 
     try:
         final_docs = await async_rerank_contexts(
-            query, docs, mm.reranker_Model, top_n
+            query, docs, mm.reranker_model, top_n
         )
     except Exception:
         final_docs = docs[:top_n]
@@ -224,11 +258,10 @@ async def rerank_node(state: DiagnoseState):
 
 def decide_next_step(state: DiagnoseState):
     """The Router Logic"""
-    score = state.get("confidence_score", 0.0)
-    docs = state.get("final_docs", [])
-
+    score = state.confidence_score
+    docs = state.final_docs
     # High confidence OR already ran RAG loop → done
-    if score >= 0.7:
+    if score >= 0.9:
         return "finish"
 
     if docs:
@@ -238,7 +271,7 @@ def decide_next_step(state: DiagnoseState):
 
 
 # Graph Construction
-diagnostic_workflow = StateGraph(DiagnoseState)
+diagnostic_workflow = StateGraph(DiagnoseState, input=DiagnoseInputState, output=DiagnoseOutputState)
 
 # Add Nodes (slim: 4 nodes only)
 diagnostic_workflow.add_node("generate", generate_node)
@@ -266,4 +299,4 @@ diagnostic_workflow.add_edge("rerank", "generate")
 
 # Compile
 diagnose_app = diagnostic_workflow.compile()
-__all__ = ["diagnose_app", "DiagnoseState"]
+__all__ = ["diagnose_app", "DiagnoseState", "DiagnoseInputState", "DiagnoseOutputState"]

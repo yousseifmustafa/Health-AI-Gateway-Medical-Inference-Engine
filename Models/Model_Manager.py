@@ -3,33 +3,35 @@ import torch
 import io
 import asyncio
 import threading
-from dotenv import load_dotenv
+import logging
 from huggingface_hub import InferenceClient
-from typing import Optional
+from typing import Optional, Type
+from pydantic import BaseModel
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage, SystemMessage
 from FlagEmbedding import FlagReranker
 import google.generativeai as genai
 from PIL import Image
 from groq import Groq
 
+
+logger = logging.getLogger("sehatech.models")
+
 # --- Import Helpers ---
 try:
-    from Helper.HF_ApiManager import hf_ApiKeyManager
-    from Helper.Groq_ApiManger import groq_ApiKeyManager
-    from Helper.Google_ApiManger import google_ApiKeyManager
-    from Helper.Image_Uploader import upload_to_cloudinary
+    from Helper.key_manager import ApiKeyManager
+    from Helper.Image_Uploader import upload_to_cloudinary, async_upload_to_cloudinary
 except ImportError:
-    print("FATAL ERROR: Helper modules not found.")
+    logger.critical("Helper modules not found.")
     exit()
-
-load_dotenv()
 
 
 class ModelManager:
-    def __init__(self, HF_key_manager, Google_key_manger, groq_keyManger):
-        self.HF_key_manager = HF_key_manager
-        self.Google_key_manger = Google_key_manger
-        self.groq_keyManger = groq_keyManger
+    def __init__(self, hf_key_manager, google_key_manager, groq_key_manager):
+        self.hf_key_manager = hf_key_manager
+        self.google_key_manager = google_key_manager
+        self.groq_key_manager = groq_key_manager
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # --- Model Configurations ---
@@ -49,7 +51,7 @@ class ModelManager:
         self._lazy_lock = threading.Lock()
 
     @property
-    def reranker_Model(self):
+    def reranker_model(self):
         """Lazy-load the reranker model on first access."""
         if self._reranker_model is None:
             with self._lazy_lock:
@@ -70,20 +72,25 @@ class ModelManager:
 
     def _init_groq(self):
         try:
-            key = self.groq_keyManger.get_next_api_key()
+            key = self.groq_key_manager.get_next_api_key()
             self.groq_client = Groq(api_key=key, timeout=10.0) if key else None
         except Exception as e:
-            print(f" Groq Init Failed: {e}")
+            logger.warning("Groq Init Failed: %s", e)
             self.groq_client = None
 
     def _init_gemini(self):
-        if self.Google_key_manger:
+        """Initialize Gemini fallback model for vision tasks only.
+        NOTE: We do NOT call genai.configure() here because the LangChain
+        ChatGoogleGenerativeAI wrapper in agent_node passes google_api_key
+        per-call, which would conflict with a global config.
+        """
+        if self.google_key_manager:
             try:
-                key = self.Google_key_manger.get_next_api_key()
+                key = self.google_key_manager.get_next_api_key()
                 genai.configure(api_key=key)
                 self.fallback_model = genai.GenerativeModel('gemini-2.5-flash')
             except Exception as e:
-                print(f"Gemini Init Failed: {e}")
+                logger.warning("Gemini Init Failed: %s", e)
                 self.fallback_model = None
 
     # --- Loaders ---
@@ -95,7 +102,7 @@ class ModelManager:
                 encode_kwargs={'normalize_embeddings': True}
             )
         except Exception as e:
-            print(f" Embedding Load Error: {e}")
+            logger.error("Embedding Load Error: %s", e)
             return None
 
     def _load_reranker_model(self):
@@ -105,12 +112,12 @@ class ModelManager:
                 use_fp16=True
             )
         except Exception as e:
-            print(f"❌ Reranker Load Error: {e}")
+            logger.error("Reranker Load Error: %s", e)
             return None
 
     # --- Synchronous Generation Methods (kept for compatibility) ---
     def _generate_hf(self, prompt: str, model_name: str) -> str:
-        client = InferenceClient(api_key=self.HF_key_manager.get_next_api_key(), timeout=10)
+        client = InferenceClient(api_key=self.hf_key_manager.get_next_api_key(), timeout=10)
         completion = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -140,11 +147,11 @@ class ModelManager:
         try:
             return self._generate_hf(prompt, hf_model_name)
         except Exception as e_hf:
-            print(f" HF Failed ({e_hf}). Switching to Groq...")
+            logger.warning("HF Failed (%s). Switching to Groq...", e_hf)
             try:
                 return self._generate_groq(prompt)
             except Exception as e_groq:
-                print(f" Groq Failed ({e_groq}). Switching to Gemini...")
+                logger.warning("Groq Failed (%s). Switching to Gemini...", e_groq)
                 try:
                     return self._generate_gemini(prompt)
                 except Exception as e_gemini:
@@ -167,7 +174,7 @@ class ModelManager:
             return "Error: No valid image provided."
 
         try:
-            client = InferenceClient(api_key=self.HF_key_manager.get_next_api_key())
+            client = InferenceClient(api_key=self.hf_key_manager.get_next_api_key())
             completion = client.chat.completions.create(
                 model=self.ocr_model_name,
                 messages=[
@@ -184,7 +191,7 @@ class ModelManager:
             return completion.choices[0].message.content
 
         except Exception as e_hf:
-            print(f" HF Vision Failed: {e_hf}. Switching to Gemini...")
+            logger.warning("HF Vision Failed: %s. Switching to Gemini...", e_hf)
             try:
                 if not self.fallback_model:
                     raise Exception("Gemini not config")
@@ -197,9 +204,134 @@ class ModelManager:
             except Exception as e_gemini:
                 return f"Vision Failure: {e_gemini}"
 
-    # --- Async Image Generation ---
+    # --- Async Image Generation (Pipelined) ---
     async def agenerate_with_image(self, text: str, image_bytes: bytes = None, image_url: str = None) -> str:
-        return await asyncio.to_thread(self.generate_with_image, text, image_bytes, image_url)
+        """
+        Fully async vision pipeline.
+        Uses asyncio.gather to pipeline Cloudinary upload + API key retrieval
+        in parallel, then calls the LLM.
+        """
+        final_url = image_url
+
+        if not final_url and image_bytes:
+            # Pipeline: upload image AND acquire API key in parallel
+            async def _get_key():
+                return await asyncio.to_thread(self.hf_key_manager.get_next_api_key)
+
+            upload_result, api_key = await asyncio.gather(
+                async_upload_to_cloudinary(image_bytes),
+                _get_key(),
+            )
+            final_url = upload_result
+        else:
+            api_key = await asyncio.to_thread(self.hf_key_manager.get_next_api_key)
+
+        if not final_url:
+            return "Error: No valid image provided."
+
+        # HF Inference call (sync SDK → thread pool)
+        try:
+            def _hf_call():
+                client = InferenceClient(api_key=api_key)
+                completion = client.chat.completions.create(
+                    model=self.ocr_model_name,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": text},
+                                {"type": "image_url", "image_url": {"url": final_url}}
+                            ]
+                        }
+                    ],
+                    max_tokens=1024
+                )
+                return completion.choices[0].message.content
+
+            return await asyncio.to_thread(_hf_call)
+
+        except Exception as e_hf:
+            logger.warning("HF Vision Failed: %s. Switching to Gemini...", e_hf)
+            try:
+                if not self.fallback_model:
+                    raise Exception("Gemini not configured")
+
+                def _gemini_call():
+                    if image_bytes:
+                        # Bytes path: open as PIL Image
+                        img = Image.open(io.BytesIO(image_bytes))
+                        response = self.fallback_model.generate_content([text, img])
+                    else:
+                        # URL path: pass via file_data part (Gemini SDK >= 0.7)
+                        response = self.fallback_model.generate_content([
+                            {"role": "user", "parts": [
+                                {"text": text},
+                                {"file_data": {"mime_type": "image/jpeg", "file_uri": final_url}}
+                            ]}
+                        ])
+                    return response.text
+
+                return await asyncio.to_thread(_gemini_call)
+
+            except Exception as e_gemini:
+                return f"Vision Failure: {e_gemini}"
+
+    # -------------------------------------------------------------------------
+    # Structured Vision Analysis — stateless, one-shot, schema-validated output
+    # -------------------------------------------------------------------------
+    async def aanalyze_image_structured(
+        self,
+        image_url: str,
+        system_prompt: str,
+        output_schema: Type[BaseModel],
+    ) -> BaseModel:
+        """
+        Calls Gemini (via LangChain ChatGoogleGenerativeAI) with a multimodal
+        message and returns a validated Pydantic instance matching `output_schema`.
+
+        Uses `with_structured_output` — Gemini's native JSON-mode — so the response
+        is always schema-conformant or raises a clear validation error.
+
+        This method is STATELESS: no LangGraph graph, no thread_id, no checkpointer.
+        It is the backend engine for the /analyze/* FastAPI endpoints.
+
+        Args:
+            image_url:     A publicly accessible URL to the image (e.g. Cloudinary).
+            system_prompt: Specialized instruction string for this analysis type.
+            output_schema: A Pydantic BaseModel class defining the expected JSON shape.
+
+        Returns:
+            A validated instance of `output_schema`.
+
+        Raises:
+            Exception: Propagates LLM or validation errors to the caller for
+                       translation into appropriate HTTP responses.
+        """
+        api_key = self.google_key_manager.get_next_api_key()
+
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=api_key,
+            temperature=0.1,   # Low temperature → deterministic, structured extraction
+        )
+
+        # Bind the output schema — instructs Gemini to return valid JSON only
+        structured_llm = llm.with_structured_output(output_schema)
+
+        # Build a multimodal message: image + instruction
+        message = HumanMessage(content=[
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text",      "text": system_prompt},
+        ])
+
+        logger.info(
+            "aanalyze_image_structured | schema=%s | image_url=%s",
+            output_schema.__name__, image_url,
+        )
+
+        # ainvoke is natively async on ChatGoogleGenerativeAI
+        result = await structured_llm.ainvoke([message])
+        return result
 
     # --- Specific Wrappers (Sync) ---
     def optimize_query(self, prompt: str) -> str:
@@ -239,12 +371,10 @@ def get_model_manager() -> ModelManager:
     if _global_mm_instance is None:
         with _global_mm_lock:
             if _global_mm_instance is None:
-                from Helper.HF_ApiManager import hf_ApiKeyManager
-                from Helper.Google_ApiManger import google_ApiKeyManager
-                from Helper.Groq_ApiManger import groq_ApiKeyManager
+                from Helper.key_manager import ApiKeyManager
                 _global_mm_instance = ModelManager(
-                    HF_key_manager=hf_ApiKeyManager(),
-                    Google_key_manger=google_ApiKeyManager(),
-                    groq_keyManger=groq_ApiKeyManager(),
+                    hf_key_manager=ApiKeyManager("hf", "HUGGINGFACE_API_KEY"),
+                    google_key_manager=ApiKeyManager("google", "GOOGLE_API_KEY"),
+                    groq_key_manager=ApiKeyManager("groq", "GROQ_API_KEY"),
                 )
     return _global_mm_instance

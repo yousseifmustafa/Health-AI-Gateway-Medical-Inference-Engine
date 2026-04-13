@@ -1,26 +1,31 @@
-from typing import Annotated, TypedDict, List
+import os
+import re
+import json
+import asyncio
+import logging
+from typing import Annotated, List, Optional
+from pydantic import BaseModel, ConfigDict
+
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, AIMessage, BaseMessage
+from langchain_core.messages import SystemMessage, AIMessage, BaseMessage, RemoveMessage
 from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import InjectedState
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_community import GoogleSearchAPIWrapper
-from dotenv import load_dotenv
-import os
-import asyncio
 from langchain_community.tools.tavily_search import TavilySearchResults
 
 try:
     from Models.Model_Manager import get_model_manager
     from Langgraphs.Diagnose_graph import diagnose_app
     from Tools.Query_Optimization_Tool import async_translate_rewrite_expand_query
-    from Database_Manager import get_checkpointer
-except ImportError:
-    pass
+    from Database_Manager import get_checkpointer, fetch_user_permanent_records, modify_user_permanent_records
+except ImportError as e:
+    logging.getLogger("sehatech.supervisor").critical("Failed to import required modules: %s", e)
+    raise SystemExit(1)
 
-load_dotenv()
+logger = logging.getLogger("sehatech.supervisor")
 
 
 @tool
@@ -43,7 +48,7 @@ async def consult_doctor_tool(symptom_description: str, medical_history: str = "
             symptom_description
         )
     except Exception as e:
-        print(f"Query optimization failed: {e}")
+        logger.warning("Query optimization failed: %s", e)
         translated = symptom_description
         expanded = [symptom_description]
 
@@ -69,16 +74,17 @@ async def analyze_medical_image_tool(query: str, state: Annotated[dict, Injected
     Inputs:
     - query: A specific question or instruction regarding the image content (e.g., "Read the medicine names", "Analyze this X-ray for fractures").
     """
-    image_bytes = state.get("image_bytes")
+    # InjectedState provides a plain dict at runtime, not the Pydantic model instance
+    image_url = state.get("image_url") if isinstance(state, dict) else getattr(state, "image_url", None)
 
     # Strict Check: No image, no service.
-    if not image_bytes:
+    if not image_url:
         return "Error: No image data found in the current state."
 
     try:
         mm = get_model_manager()
         ocr_response = await mm.agenerate_with_image(
-            text=query, image_bytes=image_bytes
+            text=query, image_url=image_url
         )
         return {"answer": ocr_response}
     except Exception as e:
@@ -106,7 +112,7 @@ async def web_search_tool(query: str):
         if not os.getenv("TAVILY_API_KEY"):
             raise Exception("Tavily API Key not found in env.")
 
-        print(f"🚀 Using Tavily Search for: {query} ...")
+        logger.info("Using Tavily Search for: %s", query)
 
         search = TavilySearchResults(
             max_results=3,
@@ -137,7 +143,7 @@ async def web_search_tool(query: str):
         return "".join(formatted_results)
 
     except Exception as e:
-        print(f"Tavily Failed: {e}. Switching to Google...")
+        logger.warning("Tavily failed: %s. Switching to Google...", e)
 
         try:
             search = GoogleSearchAPIWrapper(
@@ -169,26 +175,192 @@ async def notify_family_tool(message: str, urgency_level: str = "High"):
     - message: Brief content of the alert (e.g., "Patient reporting severe chest pain").
     - urgency_level: "High" for emergencies, "Medium" for updates.
     """
-    print(f"\n [SIMULATION] SENDING ALERT TO FAMILY")
-    print(f" Message: {message}")
-    print(f" Urgency: {urgency_level}")
-    print(f" Status: Sent Successfully via Mock Gateway\n")
+    logger.info("[SIMULATION] SENDING ALERT TO FAMILY | message=%s | urgency=%s", message, urgency_level)
     return "Success: Family notification sent successfully. The family has been alerted and will contact the patient shortly."
 
 
-# Agent Logic
-class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages]
-    image_bytes: bytes | None
-    conversation_summary: str
+@tool
+async def fetch_patient_records_tool(user_id: str):
+    """
+    PROACTIVE DISCOVERY — Call this tool at the START of any triage session.
+
+    Function:
+    Retrieves the patient's permanent medical profile (Allergies, Chronic Diseases,
+    Current Medications, Surgical History) from the SehaTech Backend API.
+
+    Patient Longitudinal Safety:
+    This data persists across ALL sessions. Using it grounds your questions in
+    known facts and prevents contraindicated recommendations.
+
+    Inputs:
+    - user_id: The unique patient identifier.
+    """
+    return await fetch_user_permanent_records(user_id)
+
+
+@tool
+async def modify_patient_records_tool(user_id: str, action: str, medical_fact: str):
+    """
+    DYNAMIC MAINTENANCE — Sync changes back to the patient's permanent record.
+
+    Function:
+    Sends a modification (ADD, REMOVE, or UPDATE) to the SehaTech Backend API
+    to keep the patient's life-long medical profile accurate.
+
+    When to Use:
+    - ADD: A new allergy, diagnosis, or medication is discovered during triage.
+    - REMOVE: The patient states they recovered from a condition or finished a treatment.
+    - UPDATE: An existing fact needs correction (e.g., dosage change).
+
+    Inputs:
+    - user_id: The unique patient identifier.
+    - action: One of 'ADD', 'REMOVE', or 'UPDATE'.
+    - medical_fact: The specific medical fact to modify (e.g., 'Penicillin allergy').
+    """
+    return await modify_user_permanent_records(user_id, action, medical_fact)
+
+
+# ============================================================================
+# STATE SCHEMAS — Multiple Schemas Pattern (Input / Output / Internal)
+# ============================================================================
+
+class SupervisorInputState(BaseModel):
+    """Schema for data accepted FROM the client (server.py / Flutter app)."""
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    messages: Annotated[list[BaseMessage], add_messages] = []
+    image_url: Optional[str] = None
+    conversation_summary: str = ""
+    user_id: Optional[str] = None
+
+
+class SupervisorOutputState(BaseModel):
+    """Schema for data returned TO the client — no internal flags or records."""
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    messages: Annotated[list[BaseMessage], add_messages] = []
+    conversation_summary: str = ""
+
+
+class AgentState(BaseModel):
+    """Internal superset — contains every field nodes may read or write."""
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    messages: Annotated[list[BaseMessage], add_messages] = []
+    image_url: Optional[str] = None
+    conversation_summary: str = ""
+    user_id: Optional[str] = None
+    patient_records: Optional[dict] = None
+    conflict_flag: bool = False
+    conflict_details: Optional[str] = None
+
+
+# ============================================================================
+# DETERMINISTIC CONFLICT DETECTOR — Runs before agent on every user turn
+# ============================================================================
+
+# Negation patterns for detecting contradictions
+_NEGATION_PATTERNS = [
+    r"\bno\s+(allergies|allergy|medications?|chronic|conditions?|surgeries|surgery|history)\b",
+    r"\bi\s+(don'?t|do\s+not)\s+(take|have|use)\b",
+    r"\bi\s+(stopped|quit|finished|completed)\b",
+    r"\bnot\s+(taking|on|using)\b",
+    r"\b(مفيش|ماعنديش|مش|ماباخدش|مابخدش|مابستخدمش|لا|مش بآخد|وقفت|خلصت)\b",
+    r"\bno\s+medical\s+history\b",
+]
+_NEGATION_RE = re.compile("|".join(_NEGATION_PATTERNS), re.IGNORECASE)
+
+
+def _detect_conflicts(user_text: str, records: dict) -> list[str]:
+    """
+    Deterministic conflict detection — zero LLM cost, zero latency.
+    Compares user's latest message against fetched permanent records.
+    Returns a list of conflict description strings (empty if no conflicts).
+    """
+    conflicts = []
+    if not records or not user_text:
+        return conflicts
+
+    text_lower = user_text.lower()
+    has_negation = bool(_NEGATION_RE.search(user_text))
+
+    if not has_negation:
+        return conflicts
+
+    # Check: "no allergies" vs non-empty allergy list
+    allergies = records.get("allergies", [])
+    if allergies and re.search(r"(no\s+allerg|مفيش\s*حساسي|ماعنديش\s*حساسي)", user_text, re.IGNORECASE):
+        conflicts.append(
+            f"Patient says NO allergies, but records show: {', '.join(allergies)}"
+        )
+
+    # Check: "no medications" vs non-empty medication list
+    meds = records.get("current_medications", [])
+    if meds and re.search(r"(no\s+medic|don'?t\s+take|not\s+taking|مش\s*بآخد|ماباخدش|مابخدش)", user_text, re.IGNORECASE):
+        conflicts.append(
+            f"Patient says NO medications, but records show active prescriptions: {', '.join(meds)}"
+        )
+
+    # Check: "no chronic conditions" vs non-empty chronic list
+    chronic = records.get("chronic_diseases", [])
+    if chronic and re.search(r"(no\s+chronic|no\s+condition|don'?t\s+have\s+any|مفيش\s*أمراض|ماعنديش)", user_text, re.IGNORECASE):
+        conflicts.append(
+            f"Patient says NO chronic conditions, but records show: {', '.join(chronic)}"
+        )
+
+    # Check: "no surgeries" vs non-empty surgical history
+    surgeries = records.get("surgical_history", [])
+    if surgeries and re.search(r"(no\s+surg|never\s+had\s+surg|مفيش\s*عملي|ماعملتش)", user_text, re.IGNORECASE):
+        conflicts.append(
+            f"Patient says NO surgical history, but records show: {', '.join(surgeries)}"
+        )
+
+    return conflicts
+
+
+async def conflict_detector_node(state: AgentState) -> dict:
+    """
+    Deterministic Conflict Detector Node.
+    Runs BEFORE agent_node on every turn. Checks the user's latest message
+    against the patient's permanent records for contradictions.
+    Sets conflict_flag and conflict_details in state.
+    """
+    records = state.patient_records
+    messages = state.messages
+
+    # No records fetched yet → passthrough
+    if not records or not messages:
+        return {"conflict_flag": False, "conflict_details": None}
+
+    # Get the latest user message
+    latest_user_msg = None
+    for msg in reversed(messages):
+        if hasattr(msg, "type") and msg.type == "human":
+            latest_user_msg = msg.content if isinstance(msg.content, str) else str(msg.content)
+            break
+
+    if not latest_user_msg:
+        return {"conflict_flag": False, "conflict_details": None}
+
+    conflicts = _detect_conflicts(latest_user_msg, records)
+
+    if conflicts:
+        detail_text = "⚠️ CONFLICT DETECTED — The following contradictions were found between the patient's statement and their permanent records:\n"
+        for i, c in enumerate(conflicts, 1):
+            detail_text += f"  {i}. {c}\n"
+        detail_text += "You MUST address these contradictions with the patient BEFORE proceeding to diagnosis."
+        logger.warning("Conflict detected for user: %s", conflicts)
+        return {"conflict_flag": True, "conflict_details": detail_text}
+
+    return {"conflict_flag": False, "conflict_details": None}
 
 
 async def agent_node(state: AgentState):
-    messages = state["messages"]
+    messages = list(state.messages)
     mm = get_model_manager()
 
     try:
-        token = mm.Google_key_manger.get_next_api_key()
+        token = mm.google_key_manager.get_next_api_key()
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
             google_api_key=token,
@@ -197,9 +369,15 @@ async def agent_node(state: AgentState):
         )
     except Exception as e:
         return {"messages": [AIMessage(content=str(e))]}
-    tools = [consult_doctor_tool, web_search_tool, notify_family_tool]
+    tools = [
+        consult_doctor_tool,
+        web_search_tool,
+        notify_family_tool,
+        fetch_patient_records_tool,
+        modify_patient_records_tool,
+    ]
 
-    if state.get("image_bytes"):
+    if state.image_url:
         tools.append(analyze_medical_image_tool)
 
     llm_with_tools = llm.bind_tools(tools)
@@ -210,20 +388,47 @@ async def agent_node(state: AgentState):
 
     **STRICT OPERATIONAL PROTOCOLS:**
 
-    1. **THE GOLDEN TRIANGLE (Top Priority):**
+    0. **STEP ZERO — PATIENT DISCOVERY (Permanent Memory):**
+    - At the VERY START of any new triage interaction (when a user_id is available), you MUST call `fetch_patient_records_tool` to load the patient's permanent medical profile.
+    - This profile contains life-long data: Allergies, Chronic Diseases, Current Medications, Surgical History.
+    - **Cross-Referencing Rule:** Once fetched, you MUST ground your questions and analysis in this data:
+        - Example: If the profile shows Type 2 Diabetes, say: "أنا شايف إنك عندك سكر من النوع التاني، خلينا نشيك على مستوى الجلوكوز الأول."
+        - Example: If the profile shows a Penicillin allergy, NEVER recommend any penicillin-class antibiotics.
+    - If the fetch returns empty/unavailable, proceed normally — this is a new patient with no prior records.
+
+    1. **MEDICAL CONFLICT DETECTION (The Safety Gate):**
+    - The system has a **deterministic conflict detector** that automatically flags contradictions between your statements and the patient's records.
+    - If a `[CONFLICT ALERT]` message appears in the conversation, you MUST:
+        1. **STOP** — Pause the triage immediately. Do NOT proceed to diagnosis with conflicting data.
+        2. **FLAG** — Politely inform the patient of each specific discrepancy.
+           - Example: "لحظة يا فندم — السجلات الطبية بتاعتك بتقول إنك بتاخد دوا للضغط (أملوديبين). هل لسه بتاخده ولا وقفته؟"
+           - Example: "I see from your records that you have Type 2 Diabetes, but you mentioned no chronic conditions. Could you help me clarify?"
+        3. **RESOLVE** — Based on the patient's clarification:
+           - If they CONFIRM the record is outdated → Call `modify_patient_records_tool` with action='REMOVE' or action='UPDATE' IMMEDIATELY.
+           - If they CONFIRM the record is correct (they forgot) → Proceed with the record data as ground truth.
+           - If UNCERTAIN → Proceed with CAUTION, note the conflict in the consultation, and pass BOTH versions to the doctor tool.
+    - **Safety Principle:** NEVER silently ignore a `[CONFLICT ALERT]`. A contradiction is a potential patient safety risk.
+
+    2. **THE GOLDEN TRIANGLE (Top Priority):**
     - Before proceeding to any diagnosis, you MUST ensure the following 4 information points are present:
         1. **Chief Complaint** (What is the main pain/issue?).
         2. **Duration** (How long has it been going on?).
         3. **Severity/Description** (Intensity, nature of pain, etc.).
-        4. **Medical History** (Chronic conditions like Diabetes, Hypertension, or current meds).
+        4. **Medical History** (Chronic conditions like Diabetes, Hypertension, or current meds — cross-reference with permanent records if available).
     - **Action:** If ANY of these points are missing, you MUST ask the user for them first. DO NOT trigger the doctor tool yet.
 
-    2. **DIAGNOSIS PHASE:**
+    3. **DIAGNOSIS PHASE:**
     - Once the "Golden Triangle" is complete, trigger the `consult_doctor_tool` immediately.
     - **Relay Rule:** When the tool returns the medical response, you MUST display it to the user.
     - **Prefix:** Start your response with: "جاري تحليل البيانات بدقة... (قد يستغرق الأمر لحظات لمراجعة المراجع الطبية). : ..."
 
-    3. **EMERGENCY NOTIFICATION (`notify_family_tool`) - HIGH SENSITIVITY:**
+    4. **DYNAMIC RECORD MAINTENANCE (Permanent Memory Sync):**
+    - If during the conversation the patient reveals NEW medical facts (new allergy, new diagnosis), you MUST call `modify_patient_records_tool` with action='ADD'.
+    - If the patient states they have RECOVERED from a condition or FINISHED a treatment (e.g., "خلصت الكورس بتاع المضاد الحيوي"), you MUST call `modify_patient_records_tool` with action='REMOVE'.
+    - If the patient corrects or updates an existing fact (e.g., changed medication dosage), use action='UPDATE'.
+    - **Confidence Rule:** Only modify records based on clear, explicit patient statements — NEVER based on inference or assumptions.
+
+    5. **EMERGENCY NOTIFICATION (`notify_family_tool`) - HIGH SENSITIVITY:**
     - **PROHIBITION:** You are strictly forbidden from using this tool autonomously without a trigger.
     - **CASE A (User Request):** If the user explicitly asks (e.g., "Tell my family", "Call my parents"), you MUST trigger the tool **IMMEDIATELY**.
         - DO NOT ask "Are you sure?".
@@ -233,38 +438,208 @@ async def agent_node(state: AgentState):
         - If User says "No": Drop the topic and proceed with triage.
         - If User says "Yes/Agree": Trigger the tool **IMMEDIATELY**.
 
-    4. **MEMORY:**
+    6. **MEMORY:**
     - Never ask for information the user has already mentioned in the conversation history.
+    - Never ask for information already present in the patient's permanent records.
 
-    5. **SMART LANGUAGE ADAPTATION (The "Sya'a" Layer):**
+    7. **SMART LANGUAGE ADAPTATION (The "Sya'a" Layer):**
     - **Goal:** You are the bridge between complex/foreign data and the simple user.
     - **Rule:** If ANY tool (Doctor, Web Search, Vision) returns information in **English** or **Formal Arabic (MSA)**, you MUST **translate and adapt** it into **Friendly Language exactly matching the user's query language** before outputting.
     - **Restriction:** Do NOT output large blocks of English text unless the user is speaking English.
     - **Exception:** You may keep specific **Drug Names** or **Medical Terms** in English, but explain them in the **Same User Language**.
 
-    6. **TONE & PERSONALITY:**
+    8. **TONE & PERSONALITY:**
     - Be warm, empathetic, and reassuring (e.g., "سلامتك يا بطل", "Don't worry").
     """)
-    all_msgs = [sys_msg] + messages
 
-    response = await llm_with_tools.ainvoke(all_msgs)
+    # --- Inject conflict alert into the message stream if flagged ---
+    conflict_details = state.conflict_details
+    if conflict_details:
+        conflict_msg = SystemMessage(content=f"[CONFLICT ALERT]\n{conflict_details}")
+        all_msgs = [sys_msg, conflict_msg] + messages
+    else:
+        all_msgs = [sys_msg] + messages
+
+    try:
+        response = await llm_with_tools.ainvoke(all_msgs)
+    except Exception as e:
+        logger.error("LLM invocation error in agent_node: %s", e)
+        response = AIMessage(content="عذراً، أواجه مشكلة تقنية في الوقت الحالي. برجاء المحاولة مرة أخرى.")
 
     return {"messages": [response]}
 
 
-# --- Graph Definition (built once, compiled lazily with checkpointer) ---
-tool_node = ToolNode([notify_family_tool, consult_doctor_tool, analyze_medical_image_tool, web_search_tool])
-workflow = StateGraph(AgentState)
+# --- Tools Postprocessor: extracts patient_records from tool output into state ---
+async def tools_postprocessor(state: AgentState) -> dict:
+    """
+    Runs AFTER the ToolNode. Scans the latest tool messages for output from
+    fetch_patient_records_tool and writes it to AgentState.patient_records
+    so the conflict_detector_node can use it on subsequent turns.
+    """
+    messages = state.messages
+    updates = {}
 
+    # Walk backwards through recent messages looking for tool responses
+    for msg in reversed(messages):
+        if not hasattr(msg, "type") or msg.type != "tool":
+            break  # Stop at first non-tool message — we only care about the latest batch
+        if getattr(msg, "name", None) == "fetch_patient_records_tool":
+            try:
+                content = msg.content
+                if isinstance(content, str):
+                    records = json.loads(content)
+                elif isinstance(content, dict):
+                    records = content
+                else:
+                    continue
+                # Only store if it looks like a valid records dict
+                if isinstance(records, dict) and "user_id" in records:
+                    updates["patient_records"] = records
+                    logger.info("patient_records populated in state for user %s.", records.get("user_id"))
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning("Failed to parse patient records from tool output: %s", e)
+
+    return updates
+
+
+# ============================================================================
+# CONVERSATION SUMMARIZATION NODE — Long-Term Memory Management
+# ============================================================================
+
+_SUMMARY_THRESHOLD = 4  # Trigger summarization when messages exceed this count
+
+_SUMMARIZE_PROMPT = """You are a medical conversation summarizer. Summarize the following conversation concisely in 2-3 sentences.
+Preserve ALL critical medical details: symptoms, diagnoses, medications, allergies, and any patient safety information.
+Keep the summary in the primary language of the conversation.
+
+Previous Summary:
+{previous_summary}
+
+Conversation:
+{conversation_text}
+
+Concise Summary:"""
+
+
+async def summarize_node(state: AgentState) -> dict:
+    """
+    Running Summary Node — triggers when len(messages) > 10.
+    1. Generates a new summary from current summary + all messages.
+    2. Trims messages to keep only the last 2.
+    Uses RemoveMessage to properly interact with the add_messages reducer.
+    """
+    messages = state.messages
+    previous_summary = state.conversation_summary
+
+    # Build conversation text from all messages
+    conversation_lines = []
+    for msg in messages:
+        if not hasattr(msg, "content"):
+            continue
+        content = msg.content
+        # Multimodal messages have content as a list of typed dicts — extract text parts only
+        if isinstance(content, list):
+            text_parts = [
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            content = " ".join(text_parts).strip()
+            if not content:
+                continue
+        elif not isinstance(content, str):
+            continue
+        role = "User" if (hasattr(msg, "type") and msg.type == "human") else "Assistant"
+        conversation_lines.append(f"{role}: {content}")
+    conversation_text = "\n".join(conversation_lines)
+
+    # Generate new summary
+    mm = get_model_manager()
+    prompt = _SUMMARIZE_PROMPT.format(
+        previous_summary=previous_summary if previous_summary else "None",
+        conversation_text=conversation_text,
+    )
+
+    try:
+        new_summary = await mm.asummarize(prompt)
+        if not new_summary or len(new_summary.strip()) < 10:
+            new_summary = previous_summary
+        else:
+            new_summary = new_summary.strip().strip('"')
+    except Exception as e:
+        logger.warning("Summarization failed: %s. Keeping previous summary.", e)
+        new_summary = previous_summary
+
+    # Trim: remove all messages except the last 2 using RemoveMessage
+    delete_messages = [RemoveMessage(id=msg.id) for msg in messages[:-2]]
+
+    logger.info("Summarized %d messages → kept last 2. Summary: %s", len(messages), new_summary[:100])
+
+    return {
+        "conversation_summary": new_summary,
+        "messages": delete_messages,
+    }
+
+
+# ============================================================================
+# AGENT ROUTER — Custom conditional edge replacing tools_condition
+# ============================================================================
+
+def agent_router(state: AgentState) -> str:
+    """
+    Routes agent output to the correct next node:
+    - "tools" if the LLM wants to call tools
+    - "summarize" if conversation is long and no tools are needed
+    - END if no tools and conversation is short
+    """
+    messages = state.messages
+    if not messages:
+        return END
+
+    last_message = messages[-1]
+
+    # If the LLM wants to call tools → route to tool node
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+
+    # No tools → check if we need to summarize
+    if len(messages) > _SUMMARY_THRESHOLD:
+        return "summarize"
+
+    return END
+
+
+# --- Graph Definition (built once, compiled lazily with checkpointer) ---
+tool_node = ToolNode([
+    notify_family_tool,
+    consult_doctor_tool,
+    analyze_medical_image_tool,
+    web_search_tool,
+    fetch_patient_records_tool,
+    modify_patient_records_tool,
+])
+workflow = StateGraph(AgentState, input=SupervisorInputState, output=SupervisorOutputState)
+
+workflow.add_node("conflict_detector", conflict_detector_node)
 workflow.add_node("agent", agent_node)
 workflow.add_node("tools", tool_node)
+workflow.add_node("tools_postprocessor", tools_postprocessor)
+workflow.add_node("summarize", summarize_node)
 
-workflow.add_edge(START, "agent")
+# START → conflict_detector → agent → [router] → tools/summarize/END
+workflow.add_edge(START, "conflict_detector")
+workflow.add_edge("conflict_detector", "agent")
 workflow.add_conditional_edges(
     "agent",
-    tools_condition,
+    agent_router,
+    {
+        "tools": "tools",
+        "summarize": "summarize",
+        END: END,
+    },
 )
-workflow.add_edge("tools", "agent")
+workflow.add_edge("tools", "tools_postprocessor")
+workflow.add_edge("tools_postprocessor", "conflict_detector")
+workflow.add_edge("summarize", END)
 
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -284,12 +659,12 @@ async def make_graph():
     if _compiled_app is None:
         try:
             checkpointer = await get_checkpointer()
-            print("INFO: Supervisor graph compiled with PostgreSQL checkpointer.")
+            logger.info("Supervisor graph compiled with PostgreSQL checkpointer.")
         except Exception as e:
-            print(f"WARNING: PostgreSQL unavailable ({e}). Falling back to MemorySaver.")
+            logger.warning("PostgreSQL unavailable (%s). Falling back to MemorySaver.", e)
             checkpointer = MemorySaver()
         _compiled_app = workflow.compile(checkpointer=checkpointer)
     return _compiled_app
 
 
-__all__ = ["make_graph", "AgentState"]
+__all__ = ["make_graph", "AgentState", "SupervisorInputState", "SupervisorOutputState"]

@@ -6,17 +6,15 @@ from langchain_core.messages import AIMessage
 try:
     from Langgraphs.supervisor_graph import main_app
     from Models.Model_Manager import ModelManager
-    from Helper.HF_ApiManager import hf_ApiKeyManager
-    from Helper.Groq_ApiManger import groq_ApiKeyManager
-    from Helper.Google_ApiManger import google_ApiKeyManager 
+    from Helper.key_manager import ApiKeyManager 
 except ImportError as e:
     print(f"Import Error: {e}")
     pass
 
 app = FastAPI(title="SehaTech API", version="1.0")
-HF_key_manager = hf_ApiKeyManager()
-Google_key_manger = google_ApiKeyManager()
-groq_ApiKeyManager = groq_ApiKeyManager()
+HF_key_manager = ApiKeyManager("hf", "HUGGINGFACE_API_KEY")
+Google_key_manger = ApiKeyManager("google", "GOOGLE_API_KEY")
+groq_ApiKeyManager = ApiKeyManager("groq", "GROQ_API_KEY")
 model_manager = ModelManager(HF_key_manager=HF_key_manager, Google_key_manger=Google_key_manger,groq_keyManger = groq_ApiKeyManager)
 finalAnswer= None
 summary = None

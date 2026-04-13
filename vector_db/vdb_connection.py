@@ -1,4 +1,5 @@
 import os
+import logging
 from dotenv import load_dotenv
 from langchain_community.vectorstores import Zilliz  
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -6,6 +7,9 @@ from langchain_core.vectorstores import VectorStoreRetriever
 from typing import Optional 
 
 load_dotenv()
+
+logger = logging.getLogger("sehatech.vectordb")
+
 
 def create_retriever(embedding_function: HuggingFaceEmbeddings, k: int = 3) -> Optional[VectorStoreRetriever]:
     """
@@ -17,11 +21,11 @@ def create_retriever(embedding_function: HuggingFaceEmbeddings, k: int = 3) -> O
         COLLECTION_NAME = os.getenv("ZILLIZ_COLLECTION", "seha_rag_collection") 
         
         if not ZILLIZ_CLOUD_URI or not ZILLIZ_CLOUD_API_KEY:
-            print("FATAL ERROR: ZILLIZ_CLOUD_URI or ZILLIZ_CLOUD_API_KEY not found in .env")
+            logger.critical("ZILLIZ_CLOUD_URI or ZILLIZ_CLOUD_API_KEY not found in .env")
             return None
             
     except Exception as e:
-        print(f"Error reading environment variables: {e}")
+        logger.error("Error reading environment variables: %s", e)
         return None
 
     try:
@@ -33,15 +37,15 @@ def create_retriever(embedding_function: HuggingFaceEmbeddings, k: int = 3) -> O
                 'token': ZILLIZ_CLOUD_API_KEY,
             },
         )
-        print("Connected to Zilliz successfully!")
+        logger.info("Connected to Zilliz successfully.")
     
     except Exception as e:
-        print(f"FATAL ERROR connecting to Zilliz vector store: {e}")
+        logger.critical("Error connecting to Zilliz vector store: %s", e)
         return None
     try:
         retriever = vector_store.as_retriever(search_kwargs={"k": k})
-        print(f"Retriever created successfully from Zilliz with k={k}.")
+        logger.info("Retriever created successfully from Zilliz with k=%d.", k)
         return retriever
     except Exception as e:
-        print(f"Error creating retriever from Zilliz store: {e}")
+        logger.error("Error creating retriever from Zilliz store: %s", e)
         return None

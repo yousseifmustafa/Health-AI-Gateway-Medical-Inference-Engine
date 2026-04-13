@@ -1,8 +1,11 @@
 import asyncio
+import logging
 from typing import List, Any
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+logger = logging.getLogger("sehatech.tools.reranker")
 
 
 def rerank_contexts(
@@ -31,6 +34,10 @@ def rerank_contexts(
     try:
         scores = reranker_model.compute_score(pairs, normalize=True)
 
+        # FlagReranker returns a float (not list) for single-pair input
+        if not isinstance(scores, list):
+            scores = [scores]
+
         scored_contexts = list(zip(scores, contexts))
 
         reranked_contexts = sorted(scored_contexts, key=lambda x: x[0], reverse=True)
@@ -40,7 +47,7 @@ def rerank_contexts(
         return top_contexts
 
     except Exception as e:
-        print(f"Error during reranking: {e}. Returning original contexts truncated.")
+        logger.error("Error during reranking: %s. Returning original contexts truncated.", e)
         return contexts[:top_n]
 
 
