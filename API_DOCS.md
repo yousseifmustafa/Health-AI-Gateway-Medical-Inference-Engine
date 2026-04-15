@@ -1,6 +1,6 @@
 # SehaBot Medical AI — API Documentation
 
-> **Version:** 2.0 &nbsp;|&nbsp; **Protocol:** REST + SSE &nbsp;|&nbsp; **Auth:** API Key *(roadmap)*
+> **Version:** 2.0 &nbsp;|&nbsp; **Protocol:** REST + SSE &nbsp;|&nbsp; **Auth:** Bearer Token
 
 SehaBot is a multimodal Medical AI suite built on FastAPI + LangGraph. It exposes three
 production-ready HTTP endpoints covering real-time conversational triage, prescription OCR,
@@ -27,9 +27,12 @@ and medicine packaging analysis.
 |-------------|----------|
 | **Local Development** | `http://localhost:8000` |
 | **Staging** | `https://staging-api.sehabot.com` |
-| **Production** | `https://api.sehabot.com` |
+| **Production** | `https://8080-dep-01kp3cxxfzs0chgwd41w54zmem-d.cloudspaces.litng.ai` |
 
 All endpoints described in this document are relative to the base URL.
+
+**Authentication:** Production currently requires a Bearer token in the `Authorization` header for all endpoints.
+Use: `Authorization: Bearer d1414a76-13c4-4267-9b96-12b0b62425f5`
 
 **Switching environments:** Define `BASE_URL` as a single constant in your client
 code and update it per deployment target — see [§8 Deployment Notes](#8-deployment-notes).
@@ -106,11 +109,13 @@ The client must read lines incrementally and parse each one independently.
 ```bash
 # Text-only query
 curl -X POST "http://localhost:8000/chat" \
+  -H "Authorization: Bearer d1414a76-13c4-4267-9b96-12b0b62425f5" \
   -F "query=عندي صداع شديد من أمس" \
   -F "user_id=patient_001"
 
 # With medical image
 curl -X POST "http://localhost:8000/chat" \
+  -H "Authorization: Bearer d1414a76-13c4-4267-9b96-12b0b62425f5" \
   -F "query=ممكن تحلل الصورة دي؟" \
   -F "user_id=patient_001" \
   -F "image=@/path/to/xray.jpg"
@@ -211,6 +216,7 @@ printed) and returns a structured JSON object containing all extracted medicatio
 
 ```bash
 curl -X POST "http://localhost:8000/analyze/prescription" \
+  -H "Authorization: Bearer d1414a76-13c4-4267-9b96-12b0b62425f5" \
   -F "image=@/path/to/prescription.jpg"
 ```
 
@@ -296,6 +302,7 @@ from the packaging.
 
 ```bash
 curl -X POST "http://localhost:8000/analyze/medicine-box" \
+  -H "Authorization: Bearer d1414a76-13c4-4267-9b96-12b0b62425f5" \
   -F "image=@/path/to/medicine_box.jpg"
 ```
 
@@ -357,6 +364,8 @@ import json
 import os
 
 BASE_URL = os.getenv("SEHABOT_API_URL", "http://localhost:8000")
+AUTH_TOKEN = "d1414a76-13c4-4267-9b96-12b0b62425f5"
+AUTH_HEADERS = {"Authorization": f"Bearer {AUTH_TOKEN}"}
 
 
 # ── 1. Stateful Chat (Streaming) ─────────────────────────────────────────────
@@ -371,6 +380,7 @@ def chat_stream(user_id: str, query: str, image_path: str = None):
         f"{BASE_URL}/chat",
         data=payload,
         files=files or None,
+        headers=AUTH_HEADERS,
         stream=True,
         timeout=180,
     ) as resp:
@@ -397,6 +407,7 @@ def analyze_prescription(image_path: str) -> dict:
         resp = requests.post(
             f"{BASE_URL}/analyze/prescription",
             files={"image": f},
+            headers=AUTH_HEADERS,
             timeout=120,
         )
     resp.raise_for_status()
@@ -410,6 +421,7 @@ def analyze_medicine_box(image_path: str) -> dict:
         resp = requests.post(
             f"{BASE_URL}/analyze/medicine-box",
             files={"image": f},
+            headers=AUTH_HEADERS,
             timeout=120,
         )
     resp.raise_for_status()
@@ -437,6 +449,7 @@ if __name__ == "__main__":
 
 ```typescript
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const AUTH_TOKEN = "d1414a76-13c4-4267-9b96-12b0b62425f5";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -485,7 +498,11 @@ async function chatStream(
   form.append("user_id", userId);
   if (imageFile) form.append("image", imageFile);
 
-  const resp = await fetch(`${BASE_URL}/chat`, { method: "POST", body: form });
+  const resp = await fetch(`${BASE_URL}/chat`, { 
+    method: "POST", 
+    headers: { "Authorization": `Bearer ${AUTH_TOKEN}` },
+    body: form 
+  });
 
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }));
@@ -528,6 +545,7 @@ async function analyzePrescription(imageFile: File): Promise<PrescriptionRespons
 
   const resp = await fetch(`${BASE_URL}/analyze/prescription`, {
     method: "POST",
+    headers: { "Authorization": `Bearer ${AUTH_TOKEN}` },
     body: form,
   });
 
@@ -546,6 +564,7 @@ async function analyzeMedicineBox(imageFile: File): Promise<MedicineBoxResponse>
 
   const resp = await fetch(`${BASE_URL}/analyze/medicine-box`, {
     method: "POST",
+    headers: { "Authorization": `Bearer ${AUTH_TOKEN}` },
     body: form,
   });
 
@@ -575,7 +594,7 @@ BASE_URL = os.getenv("SEHABOT_API_URL", "http://localhost:8000")
 
 ```bash
 # Production
-SEHABOT_API_URL=https://api.sehabot.com python your_script.py
+SEHABOT_API_URL=https://8080-dep-01kp3cxxfzs0chgwd41w54zmem-d.cloudspaces.litng.ai python your_script.py
 
 # Staging
 SEHABOT_API_URL=https://staging-api.sehabot.com python your_script.py
@@ -590,7 +609,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 
 `.env.production`:
 ```
-NEXT_PUBLIC_API_URL=https://api.sehabot.com
+NEXT_PUBLIC_API_URL=https://8080-dep-01kp3cxxfzs0chgwd41w54zmem-d.cloudspaces.litng.ai
 ```
 
 #### Flutter
@@ -603,7 +622,7 @@ const String kBaseUrl = String.fromEnvironment(
 ```
 
 ```bash
-flutter build apk --dart-define=API_BASE_URL=https://api.sehabot.com
+flutter build apk --dart-define=API_BASE_URL=https://8080-dep-01kp3cxxfzs0chgwd41w54zmem-d.cloudspaces.litng.ai
 ```
 
 ---

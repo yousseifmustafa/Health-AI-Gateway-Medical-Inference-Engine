@@ -1,55 +1,56 @@
-torch
-FlagEmbedding
+# ── Crypto / Auth (MUST be first — many packages depend on it) ───────────────
+cryptography==41.0.7          # GLIBC-safe; fixes ImportError on Lightning AI
 
-# FastAPI and ASGI Server (for production deployment)
-fastapi
-uvicorn[standard]
-gunicorn
+# ── FastAPI stack ────────────────────────────────────────────────────────────
+fastapi>=0.111.0,<0.113.0
+uvicorn[standard]>=0.29.0,<0.31.0
+gunicorn>=22.0.0,<23.0.0
+python-multipart>=0.0.9       # multipart/form-data (image uploads)
+slowapi>=0.1.9                # rate limiting middleware
 
-# Core Python Utilities
-python-dotenv
-requests 
-pydantic
-typing-extensions
+# ── Core Python utilities ────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+requests>=2.31.0
+pydantic>=2.7.0,<3.0.0
+typing-extensions>=4.11.0
+aiofiles>=23.0.0
 
-# Async HTTP Client (for Backend API Sync — Permanent Memory Layer)
-httpx
+# ── Async HTTP client (Backend API Sync / WAL layer) ────────────────────────
+httpx>=0.27.0,<0.29.0
 
-# Rate Limiting (FastAPI middleware)
-slowapi
+# ── Image handling (Cloudinary upload + PIL vision fallback) ─────────────────
+Pillow>=10.3.0,<11.0.0
+cloudinary>=1.40.0
 
-# Image/File Handling (Needed for /ocr_analyze endpoint)
-python-multipart 
-Pillow 
-cloudinary
-aiofiles
+# ── LangChain / LangGraph core ───────────────────────────────────────────────
+langchain>=0.2.0,<0.4.0
+langchain-core>=0.2.0,<0.4.0
+langchain-community>=0.2.0,<0.4.0
+langgraph>=0.2.0,<0.3.0
 
-accelerate
-bitsandbytes
+# ── LangGraph PostgreSQL persistence ────────────────────────────────────────
+psycopg[binary,pool]>=3.1.19,<4.0.0
+psycopg-pool>=3.2.0,<4.0.0
+langgraph-checkpoint-postgres>=1.0.0,<2.0.0
 
-# --- 2. Core AI Frameworks (The Brain) ---
-langchain
-langchain-core
-langchain-community
-langgraph
+# ── LLM / model integrations ─────────────────────────────────────────────────
+langchain-google-genai>=1.0.0,<3.0.0
+langchain-google-community>=1.0.0,<3.0.0
+google-generativeai>=0.7.0,<1.0.0
+langchain-huggingface>=0.0.3
+huggingface-hub>=0.23.0,<1.0.0
+groq>=0.9.0,<1.0.0
+langchain_tavily>=0.1.0
+transformers>=4.38.0
+peft>=0.9.0
 
-# --- LangGraph PostgreSQL Persistence ---
-psycopg[binary,pool]
-langgraph-checkpoint-postgres
+# ── Local embeddings / reranker ──────────────────────────────────────────────
+sentence-transformers>=3.0.0,<4.0.0
+FlagEmbedding>=1.2.10,<2.0.0
+pymilvus>=2.4.0,<3.0.0
 
-langchain-huggingface
+torch>=2.3.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
 
-# --- 3. API Integrations ---
-langchain-google-genai
-langchain-google-community
-google-generativeai
-groq
-huggingface-hub
-langchain_tavily
-
-# --- 4. Local Models & Embeddings ---
-sentence-transformers
-pymilvus
-
-psycopg-pool
 

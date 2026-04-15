@@ -1,111 +1,25 @@
 from typing import List, Optional, Any
 from langgraph.graph import StateGraph, END, START
 import asyncio
-import threading
 import logging
 from langchain_core.messages import SystemMessage, HumanMessage
-from pydantic import BaseModel, Field, ConfigDict
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+from Langgraphs.states import DiagnoseInputState, DiagnoseOutputState, DiagnoseState, GradeOutput
+from Langgraphs.prompts import DIAGNOSE_SYSTEM_PROMPT, DIAGNOSE_USER_PROMPT, GRADING_SYSTEM_PROMPT
+from Langgraphs.utils import _get_retriever
 
 logger = logging.getLogger("sehatech.diagnose")
 
 try:
     from Models.Model_Manager import get_model_manager
-    from vector_db.vdb_connection import create_retriever
     from Tools.reranker_tool import async_rerank_contexts
     from Tools.parallel_retrievs_tool import parallel_retrieval
 except ImportError as e:
     logger.critical("Could not import helper functions: %s", e)
     exit()
 
-
-
-# --- Lazy Retriever Holder (ModelManager is shared via get_model_manager) ---
-class _RetrieverHolder:
-    """Lazy singleton for the vector DB retriever only. 
-    ModelManager comes from the shared singleton."""
-    
-    _instance = None
-    _lock = threading.Lock()
-
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._retriever = None
-        return cls._instance
-
-    @property
-    def context_retriever(self):
-        """Lazy-load the retriever on first access (requires embedding model)."""
-        if self._retriever is None:
-            with self._lock:
-                if self._retriever is None:
-                    logger.info("Lazy-initializing Zilliz Retriever...")
-                    mm = get_model_manager()
-                    retriever = create_retriever(mm.embedding_model)
-                    if retriever is None:
-                        raise RuntimeError(
-                            "Failed to create Zilliz retriever — check ZILLIZ_URI and ZILLIZ_TOKEN."
-                        )
-                    self._retriever = retriever
-        return self._retriever
-
-
-def _get_retriever():
-    return _RetrieverHolder().context_retriever
-
-
-# ============================================================================
-# STATE SCHEMAS — Multiple Schemas Pattern (Input / Output / Internal)
-# ============================================================================
-
-class DiagnoseInputState(BaseModel):
-    """Schema for data accepted FROM the supervisor's consult_doctor_tool."""
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
-
-    user_query: str = ""
-    conversation_summary: str = ""
-    translated_query: str = ""
-    expanded_queries: list[str] = []
-
-
-class DiagnoseOutputState(BaseModel):
-    """Schema for data returned TO the caller — no RAG chunks or scores."""
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
-
-    final_answer: Optional[str] = None
-
-
-class DiagnoseState(BaseModel):
-    """Internal superset — contains every field nodes may read or write."""
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
-
-    user_query: str = ""
-    conversation_summary: str = ""
-
-    # Pre-optimized by the Supervisor — passed as initial inputs
-    translated_query: str = ""
-    expanded_queries: list[str] = []
-
-    # Unified Answer Field
-    english_medical_answer: str = ""
-    confidence_score: float = 0.0
-
-    # RAG Fields (strings only — no heavy Document objects in state)
-    support_contents: list[str] = []
-    final_docs: list[str] = []
-
-    final_answer: Optional[str] = None
-
-
-# --- 2. Helper Models ---
-class GradeOutput(BaseModel):
-    score: float = Field(description="Confidence score between 0.0 and 1.0 regarding medical accuracy and safety.")
-
-
-# --- 3. Nodes ---
+# --- Nodes ---
 
 async def generate_node(state: DiagnoseState):
     """
@@ -130,54 +44,15 @@ async def generate_node(state: DiagnoseState):
         evidence_block = "No external evidence provided. Rely SOLELY on your internal medical knowledge."
 
     # --- Self-Validating Prompt ---
-    system_prompt = f"""You are an expert-level Medical Analyst AI with built-in Quality Assurance.
-Your purpose is to provide a detailed, validated, and professionally formatted diagnostic response.
-
-STRICT PROTOCOL — Follow ALL steps in order:
-
-**STEP 1: ANALYZE**
-- Assess the clinical picture from the user query.
-- If provided evidence exists, cross-reference it. Discard irrelevant or contradictory evidence.
-- Formulate a Differential Diagnosis (if applicable).
-
-**STEP 2: SELF-VALIDATE**
-- Before outputting, internally verify:
-  1. Factual Accuracy: No hallucinated drug names, dosages, or conditions.
-  2. Medical Safety: No dangerous or misleading advice.
-  3. Completeness: All aspects of the query are addressed.
-- If you detect an error in your own reasoning, correct it silently before output.
-
-**STEP 3: FORMAT & LANGUAGE MATCH**
-- **Language Detection**: Analyze the "Original User Query" below. Detect its exact language and dialect (e.g., Egyptian Arabic, Gulf Arabic, Formal Arabic MSA, English).
-- **Output Language**: Your ENTIRE response MUST be in the SAME language/dialect as the Original User Query.
-- **Hybrid Translation Rule**: Keep technical medical terms and drug names in English inside brackets, e.g., (Paracetamol), (Hypertension), then explain them in the user's language.
-- **Formatting**: Use structured bullet points (•) and clear section headers. Be professional but warm.
-
-EXAMPLE OUTPUT STRUCTURE (adapt language to match user):
-• **التشخيص المحتمل (Possible Diagnosis):** [...]
-• **الأسباب المحتملة (Possible Causes):** [...]
-• **الخطوات المقترحة (Recommended Actions):** [...]
-• **أدوية مقترحة (Suggested Medications):** [...]
-• ** تحذيرات (Warnings):** [...]
-"""
-
-    user_prompt = f"""## Previous Conversation Summary:
-{summary.strip() if summary else "None"}
-
-## Original User Query (MATCH THIS LANGUAGE/DIALECT):
-{user_query}
-
-## Translated Medical Query (for your internal analysis):
-{query}
-
-{evidence_block}
-
-## Task:
-Provide your expert, self-validated medical analysis following ALL protocol steps above.
-"""
+    user_prompt = DIAGNOSE_USER_PROMPT.format(
+        summary=summary.strip() if summary else "None",
+        user_query=user_query,
+        query=query,
+        evidence_block=evidence_block
+    )
 
     try:
-        final_input = f"{system_prompt}\n\n{user_prompt}"
+        final_input = f"{DIAGNOSE_SYSTEM_PROMPT}\n\n{user_prompt}"
         answer = await mm.agenerate_answer(final_input)
     except Exception as e:
         logger.exception("Generator Error")
@@ -199,17 +74,13 @@ async def grade_answer_node(state: DiagnoseState):
             temperature=0
         )
         grader_llm = llm.with_structured_output(GradeOutput)
-        system_msg = """You are a strict medical supervisor. Rate the answer based on:
-        1. Relevance to the query.
-        2. Medical Safety (no dangerous hallucinations).
-        3. Completeness.
-        Give a score < 0.7 if the answer is vague, says "I don't know", or needs external verification.
-        """
 
         grade = await grader_llm.ainvoke([
-            SystemMessage(content=system_msg),
+            SystemMessage(content=GRADING_SYSTEM_PROMPT),
             HumanMessage(content=f"Query: {query}\nAnswer: {answer}")
-        ])
+        ],
+        config={"callbacks": []}
+        )
         score = grade.score
         logger.info("Grade Score = %s", score)
     except Exception as e:
@@ -254,7 +125,7 @@ async def rerank_node(state: DiagnoseState):
     return {"final_docs": final_docs}
 
 
-# --- 4. Logic & Graph Wiring ---
+# --- Logic & Graph Wiring ---
 
 def decide_next_step(state: DiagnoseState):
     """The Router Logic"""
